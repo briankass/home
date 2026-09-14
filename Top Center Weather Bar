@@ -1,0 +1,1074 @@
+// ==WindhawkMod==
+// @id              top-center-weather-bar
+// @name            Top Center Weather Bar
+// @description     Clean black dashboard flyout with 3-column metrics (Sunrise/Sunset), temperature range bars, and direct pixel positioning.
+// @version         2.6.3
+// @author          Custom
+// @include         explorer.exe
+// @compilerOptions -lgdi32 -luser32 -lwininet -ldwmapi -luxtheme -lshell32 -lmsimg32
+// ==/WindhawkMod==
+
+// ==WindhawkModReadme==
+/*
+Top Center Weather Bar - Stable Edition
+- Raw 1:1 pixel alignment for both X and Y offsets (no DPI stretching conflicts)
+- Handles WM_DISPLAYCHANGE for resolution initialization on startup
+- Pure OLED black flyout with 3-column metrics and range bars
+- Flush alignment with system top bar
+*/
+// ==/WindhawkModReadme==
+
+// ==WindhawkModSettings==
+/*
+- font_size: 13
+  $name: Font Size
+- text_color: "FFFFFF"
+  $name: Text Color (HEX)
+- y_offset: 6
+  $name: Vertical Offset (Y)
+- x_offset: 680
+  $name: Distance From Right Screen Edge (X)
+- latitude: "34.3000"
+  $name: Latitude (Decimal degrees, e.g. 34.3000)
+- longitude: "-77.8700"
+  $name: Longitude (Decimal degrees, e.g. -77.8700)
+- location_name: "Murrayville, NC"
+  $name: Display Location Name
+*/
+// ==/WindhawkModSettings==
+
+#include <windows.h>
+#include <windhawk_api.h>
+#include <wininet.h>
+#include <strsafe.h>
+#include <dwmapi.h>
+#include <shellapi.h>
+#include <stdio.h>
+
+struct {
+    int fontSize;
+    COLORREF textColor;
+    int yOffset;
+    int xOffset;
+    WCHAR latitude[32];
+    WCHAR longitude[32];
+    WCHAR locationName[64];
+} g_settings;
+
+struct HourlyForecast {
+    WCHAR time[16];
+    WCHAR icon[8];
+    int temp;
+};
+
+struct DailyForecast {
+    WCHAR day[16];
+    WCHAR icon[8];
+    int minTemp;
+    int maxTemp;
+};
+
+struct WeatherData {
+    WCHAR location[64];
+    WCHAR conditionText[32];
+    WCHAR currentIcon[8];
+    int weatherCode;
+    int currentTemp;
+    int apparentTemp;
+    int highTemp;
+    int lowTemp;
+    int precipProb;
+    int humidity;
+    float windSpeed;
+    WCHAR windDir[8];
+    float uvIndex;
+    int isDay;
+    WCHAR sunriseTime[16];
+    WCHAR sunsetTime[16];
+    HourlyForecast hourly[5];
+    DailyForecast daily[5];
+    int weekMinTemp;
+    int weekMaxTemp;
+    WCHAR lastUpdated[32];
+    BOOL valid;
+} g_weather;
+
+HWND g_hWndWeather = NULL;
+HWND g_hWndFlyout = NULL;
+HANDLE g_hWeatherThread = NULL;
+DWORD g_weatherThreadId = 0;
+UINT_PTR g_timerZOrder = 0;
+UINT_PTR g_timerWeather = 0;
+UINT_PTR g_timerClock = 0;
+
+HFONT g_hFont = NULL;
+HFONT g_hFontHeroTemp = NULL;
+HFONT g_hFontTitle = NULL;
+HFONT g_hFontNormal = NULL;
+HFONT g_hFontBold = NULL;
+HFONT g_hFontSmall = NULL;
+
+volatile BOOL g_bRunning = TRUE;
+int g_currentDpi = 96;
+
+WCHAR g_weatherStr[32] = L"";
+
+int ScaleDpi(int val) {
+    return MulDiv(val, g_currentDpi, 96);
+}
+
+COLORREF HexToColorRef(PCWSTR hex) {
+    if (!hex || wcslen(hex) < 6) return RGB(255, 255, 255);
+    int r = 0, g = 0, b = 0;
+    swscanf_s(hex, L"%02x%02x%02x", &r, &g, &b);
+    return RGB(r, g, b);
+}
+
+const wchar_t* GetWeatherInfo(int code, int isDay, WCHAR* outText, size_t textLen) {
+    const wchar_t* icon = isDay ? L"☀️" : L"🌙";
+    const wchar_t* text = isDay ? L"Sunny" : L"Clear";
+
+    switch (code) {
+        case 0:  icon = isDay ? L"☀️" : L"🌙"; text = isDay ? L"Clear Sky" : L"Clear"; break;
+        case 1:
+        case 2:  icon = isDay ? L"🌤️" : L"☁️"; text = L"Partly Cloudy"; break;
+        case 3:  icon = L"☁️"; text = L"Overcast"; break;
+        case 45:
+        case 48: icon = L"🌫️"; text = L"Fog"; break;
+        case 51:
+        case 53:
+        case 55: icon = L"🌧️"; text = L"Drizzle"; break;
+        case 61:
+        case 63:
+        case 65: icon = L"🌧️"; text = L"Rain"; break;
+        case 71:
+        case 73:
+        case 75:
+        case 77: icon = L"❄️"; text = L"Snow"; break;
+        case 80:
+        case 81:
+        case 82: icon = isDay ? L"🌦️" : L"🌧️"; text = L"Rain Showers"; break;
+        case 95:
+        case 96:
+        case 99: icon = L"⛈️"; text = L"Thunderstorm"; break;
+    }
+
+    if (outText && textLen > 0) StringCchCopyW(outText, textLen, text);
+    return icon;
+}
+
+const wchar_t* DegreesToCompass(int deg) {
+    const wchar_t* dirs[] = { L"N", L"NE", L"E", L"SE", L"S", L"SW", L"W", L"NW", L"N" };
+    return dirs[(int)((deg + 22.5f) / 45.0f) % 8];
+}
+
+void LoadSettings() {
+    g_settings.fontSize = Wh_GetIntSetting(L"font_size");
+    if (g_settings.fontSize <= 0) g_settings.fontSize = 13;
+
+    PCWSTR hexColor = Wh_GetStringSetting(L"text_color");
+    g_settings.textColor = HexToColorRef(hexColor);
+    Wh_FreeStringSetting(hexColor);
+
+    g_settings.yOffset = Wh_GetIntSetting(L"y_offset");
+    if (g_settings.yOffset == 0) g_settings.yOffset = 6;
+
+    g_settings.xOffset = Wh_GetIntSetting(L"x_offset");
+    if (g_settings.xOffset <= 0) g_settings.xOffset = 680;
+
+    PCWSTR latStr = Wh_GetStringSetting(L"latitude");
+    if (latStr && wcslen(latStr) > 0) StringCchCopyW(g_settings.latitude, ARRAYSIZE(g_settings.latitude), latStr);
+    else StringCchCopyW(g_settings.latitude, ARRAYSIZE(g_settings.latitude), L"34.3000");
+    Wh_FreeStringSetting(latStr);
+
+    PCWSTR lonStr = Wh_GetStringSetting(L"longitude");
+    if (lonStr && wcslen(lonStr) > 0) StringCchCopyW(g_settings.longitude, ARRAYSIZE(g_settings.longitude), lonStr);
+    else StringCchCopyW(g_settings.longitude, ARRAYSIZE(g_settings.longitude), L"-77.8700");
+    Wh_FreeStringSetting(lonStr);
+
+    PCWSTR locStr = Wh_GetStringSetting(L"location_name");
+    if (locStr && wcslen(locStr) > 0) StringCchCopyW(g_settings.locationName, ARRAYSIZE(g_settings.locationName), locStr);
+    else StringCchCopyW(g_settings.locationName, ARRAYSIZE(g_settings.locationName), L"Murrayville, NC");
+    Wh_FreeStringSetting(locStr);
+
+    HDC hdc = GetDC(NULL);
+    g_currentDpi = GetDeviceCaps(hdc, LOGPIXELSY);
+    ReleaseDC(NULL, hdc);
+
+    if (g_hFont) { DeleteObject(g_hFont); g_hFont = NULL; }
+    if (g_hFontHeroTemp) { DeleteObject(g_hFontHeroTemp); g_hFontHeroTemp = NULL; }
+    if (g_hFontTitle) { DeleteObject(g_hFontTitle); g_hFontTitle = NULL; }
+    if (g_hFontNormal) { DeleteObject(g_hFontNormal); g_hFontNormal = NULL; }
+    if (g_hFontBold) { DeleteObject(g_hFontBold); g_hFontBold = NULL; }
+    if (g_hFontSmall) { DeleteObject(g_hFontSmall); g_hFontSmall = NULL; }
+
+    int barH = -MulDiv(g_settings.fontSize, g_currentDpi, 72);
+    g_hFont = CreateFontW(barH, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+        CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI Variable Display");
+
+    int heroH = -MulDiv(38, g_currentDpi, 72);
+    g_hFontHeroTemp = CreateFontW(heroH, 0, 0, 0, FW_LIGHT, FALSE, FALSE, FALSE,
+        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+        CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI Variable Display");
+
+    int titleH = -MulDiv(15, g_currentDpi, 72);
+    g_hFontTitle = CreateFontW(titleH, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
+        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+        CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI Variable Display");
+
+    int normH = -MulDiv(10, g_currentDpi, 72);
+    g_hFontNormal = CreateFontW(normH, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+        CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI Variable Display");
+
+    g_hFontBold = CreateFontW(normH, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
+        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+        CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI Variable Display");
+
+    int smallH = -MulDiv(8, g_currentDpi, 72);
+    g_hFontSmall = CreateFontW(smallH, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+        CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI Variable Display");
+}
+
+BOOL IsMonitorInFullscreen(HWND hTargetWnd) {
+    HMONITOR hMon = MonitorFromWindow(hTargetWnd, MONITOR_DEFAULTTONEAREST);
+    if (!hMon) return FALSE;
+
+    MONITORINFO mi = { sizeof(mi) };
+    if (!GetMonitorInfoW(hMon, &mi)) return FALSE;
+
+    HWND hFg = GetForegroundWindow();
+    if (!hFg || hFg == hTargetWnd || hFg == g_hWndFlyout) return FALSE;
+
+    WCHAR className[64] = {0};
+    GetClassNameW(hFg, className, ARRAYSIZE(className));
+    if (wcscmp(className, L"Progman") == 0 ||
+        wcscmp(className, L"WorkerW") == 0 ||
+        wcscmp(className, L"Shell_TrayWnd") == 0 ||
+        wcscmp(className, L"Shell_SecondaryTrayWnd") == 0) {
+        return FALSE;
+    }
+
+    RECT rcFg;
+    if (GetWindowRect(hFg, &rcFg)) {
+        if (rcFg.left <= mi.rcMonitor.left &&
+            rcFg.top <= mi.rcMonitor.top &&
+            rcFg.right >= mi.rcMonitor.right &&
+            rcFg.bottom >= mi.rcMonitor.bottom) {
+            return TRUE;
+        }
+    }
+    return FALSE;
+}
+
+void ParseForecastJson(const char* json) {
+    StringCchCopyW(g_weather.location, ARRAYSIZE(g_weather.location), g_settings.locationName);
+
+    // Current conditions
+    const char* current = strstr(json, "\"current\":");
+    int curCode = 0;
+    if (current) {
+        float temp = 0.0f, appTemp = 0.0f, windSpd = 0.0f, uv = 0.0f;
+        int hum = 0, isDayVal = 1, windDeg = 0;
+        const char* p;
+        if ((p = strstr(current, "\"temperature_2m\":"))) sscanf_s(p + 17, "%f", &temp);
+        if ((p = strstr(current, "\"apparent_temperature\":"))) sscanf_s(p + 23, "%f", &appTemp);
+        if ((p = strstr(current, "\"relative_humidity_2m\":"))) sscanf_s(p + 24, "%d", &hum);
+        if ((p = strstr(current, "\"weather_code\":"))) sscanf_s(p + 15, "%d", &curCode);
+        if ((p = strstr(current, "\"wind_speed_10m\":"))) sscanf_s(p + 17, "%f", &windSpd);
+        if ((p = strstr(current, "\"wind_direction_10m\":"))) sscanf_s(p + 21, "%d", &windDeg);
+        if ((p = strstr(current, "\"uv_index\":"))) sscanf_s(p + 11, "%f", &uv);
+        if ((p = strstr(current, "\"is_day\":"))) sscanf_s(p + 9, "%d", &isDayVal);
+
+        g_weather.currentTemp = (int)(temp >= 0 ? temp + 0.5f : temp - 0.5f);
+        g_weather.apparentTemp = (int)(appTemp >= 0 ? appTemp + 0.5f : appTemp - 0.5f);
+        g_weather.humidity = hum;
+        g_weather.windSpeed = windSpd;
+        g_weather.uvIndex = uv;
+        g_weather.isDay = isDayVal;
+        g_weather.weatherCode = curCode;
+        StringCchCopyW(g_weather.windDir, ARRAYSIZE(g_weather.windDir), DegreesToCompass(windDeg));
+
+        const wchar_t* ico = GetWeatherInfo(curCode, g_weather.isDay, g_weather.conditionText, ARRAYSIZE(g_weather.conditionText));
+        StringCchCopyW(g_weather.currentIcon, ARRAYSIZE(g_weather.currentIcon), ico);
+        StringCchPrintfW(g_weatherStr, ARRAYSIZE(g_weatherStr), L"%s %d°F", g_weather.currentIcon, g_weather.currentTemp);
+    }
+
+    // Daily & Astronomical Milestones
+    const char* daily = strstr(json, "\"daily\":");
+    if (daily) {
+        const char* pTime = strstr(daily, "\"time\":[");
+        const char* pCode = strstr(daily, "\"weather_code\":[");
+        const char* pMax = strstr(daily, "\"temperature_2m_max\":[");
+        const char* pMin = strstr(daily, "\"temperature_2m_min\":[");
+        const char* pPop = strstr(daily, "\"precipitation_probability_max\":[");
+        const char* pRise = strstr(daily, "\"sunrise\":[");
+        const char* pSet = strstr(daily, "\"sunset\":[");
+
+        if (pRise) {
+            int rH = 0, rM = 0;
+            const char* tQ = strstr(pRise, "T");
+            if (tQ && sscanf_s(tQ + 1, "%d:%d", &rH, &rM) == 2) {
+                int rH12 = rH % 12; if (rH12 == 0) rH12 = 12;
+                StringCchPrintfW(g_weather.sunriseTime, ARRAYSIZE(g_weather.sunriseTime), L"%d:%02d AM", rH12, rM);
+            }
+        }
+        if (pSet) {
+            int sH = 0, sM = 0;
+            const char* tQ = strstr(pSet, "T");
+            if (tQ && sscanf_s(tQ + 1, "%d:%d", &sH, &sM) == 2) {
+                int sH12 = sH % 12; if (sH12 == 0) sH12 = 12;
+                StringCchPrintfW(g_weather.sunsetTime, ARRAYSIZE(g_weather.sunsetTime), L"%d:%02d PM", sH12, sM);
+            }
+        }
+
+        if (pTime && pCode && pMax && pMin) {
+            pTime += 8; pCode += 16; pMax += 22; pMin += 22;
+            if (pPop) pPop += 33;
+
+            const wchar_t* days[] = { L"Sun", L"Mon", L"Tue", L"Wed", L"Thu", L"Fri", L"Sat" };
+            g_weather.weekMinTemp = 999;
+            g_weather.weekMaxTemp = -999;
+
+            for (int i = 0; i < 5; i++) {
+                int y = 0, m = 0, d = 0;
+                if (sscanf_s(pTime, "\"%d-%d-%d\"", &y, &m, &d) == 3) {
+                    SYSTEMTIME st = {0};
+                    st.wYear = (WORD)y; st.wMonth = (WORD)m; st.wDay = (WORD)d;
+                    FILETIME ft;
+                    SystemTimeToFileTime(&st, &ft);
+                    FileTimeToSystemTime(&ft, &st);
+                    StringCchCopyW(g_weather.daily[i].day, 16, days[st.wDayOfWeek % 7]);
+                    pTime = strstr(pTime, ","); if (pTime) pTime++;
+                }
+
+                int dCode = 0;
+                sscanf_s(pCode, "%d", &dCode);
+                StringCchCopyW(g_weather.daily[i].icon, 8, GetWeatherInfo(dCode, 1, NULL, 0));
+                pCode = strchr(pCode, ','); if (pCode) pCode++;
+
+                float mx = 0.0f, mn = 0.0f;
+                sscanf_s(pMax, "%f", &mx);
+                sscanf_s(pMin, "%f", &mn);
+                g_weather.daily[i].maxTemp = (int)(mx >= 0 ? mx + 0.5f : mx - 0.5f);
+                g_weather.daily[i].minTemp = (int)(mn >= 0 ? mn + 0.5f : mn - 0.5f);
+
+                if (g_weather.daily[i].minTemp < g_weather.weekMinTemp) g_weather.weekMinTemp = g_weather.daily[i].minTemp;
+                if (g_weather.daily[i].maxTemp > g_weather.weekMaxTemp) g_weather.weekMaxTemp = g_weather.daily[i].maxTemp;
+
+                if (i == 0) {
+                    g_weather.highTemp = g_weather.daily[0].maxTemp;
+                    g_weather.lowTemp = g_weather.daily[0].minTemp;
+                    if (pPop) {
+                        int popVal = 0;
+                        sscanf_s(pPop, "%d", &popVal);
+                        g_weather.precipProb = popVal;
+                    }
+                }
+
+                pMax = strchr(pMax, ','); if (pMax) pMax++;
+                pMin = strchr(pMin, ','); if (pMin) pMin++;
+                if (pPop) { pPop = strchr(pPop, ','); if (pPop) pPop++; }
+            }
+        }
+    }
+
+    // Hourly Forecast (Next 5 Hours)
+    const char* hourly = strstr(json, "\"hourly\":");
+    if (hourly) {
+        const char* pTime = strstr(hourly, "\"time\":[");
+        const char* pTemp = strstr(hourly, "\"temperature_2m\":[");
+        const char* pCode = strstr(hourly, "\"weather_code\":[");
+        const char* pIsDay = strstr(hourly, "\"is_day\":[");
+
+        if (pTime && pTemp && pCode && pIsDay) {
+            pTime += 8; pTemp += 18; pCode += 16; pIsDay += 10;
+
+            SYSTEMTIME stNow;
+            GetLocalTime(&stNow);
+            int currentHour = stNow.wHour;
+
+            while (*pTime && *pTime != ']') {
+                int h = 0;
+                const char* tQuote = strstr(pTime, "T");
+                if (tQuote) {
+                    sscanf_s(tQuote + 1, "%d", &h);
+                    if (h >= currentHour || (currentHour == 23 && h == 0)) break;
+                }
+
+                const char* nextT = strchr(pTime, ',');
+                const char* nextTmp = strchr(pTemp, ',');
+                const char* nextCd = strchr(pCode, ',');
+                const char* nextDay = strchr(pIsDay, ',');
+
+                if (!nextT || !nextTmp || !nextCd || !nextDay) break;
+
+                pTime = nextT + 1;
+                pTemp = nextTmp + 1;
+                pCode = nextCd + 1;
+                pIsDay = nextDay + 1;
+            }
+
+            for (int i = 0; i < 5 && *pTime && *pTime != ']'; i++) {
+                int hour = 0;
+                const char* tQuote = strstr(pTime, "T");
+                if (tQuote) {
+                    sscanf_s(tQuote + 1, "%d", &hour);
+                    if (hour == 0) StringCchCopyW(g_weather.hourly[i].time, 16, L"12 AM");
+                    else if (hour < 12) StringCchPrintfW(g_weather.hourly[i].time, 16, L"%d AM", hour);
+                    else if (hour == 12) StringCchCopyW(g_weather.hourly[i].time, 16, L"12 PM");
+                    else StringCchPrintfW(g_weather.hourly[i].time, 16, L"%d PM", hour - 12);
+                    pTime = strstr(tQuote, ","); if (pTime) pTime++;
+                }
+
+                float hTemp = 0.0f;
+                sscanf_s(pTemp, "%f", &hTemp);
+                g_weather.hourly[i].temp = (int)(hTemp >= 0 ? hTemp + 0.5f : hTemp - 0.5f);
+                pTemp = strchr(pTemp, ','); if (pTemp) pTemp++;
+
+                int hCode = 0, hIsDay = 1;
+                sscanf_s(pCode, "%d", &hCode);
+                sscanf_s(pIsDay, "%d", &hIsDay);
+                StringCchCopyW(g_weather.hourly[i].icon, 8, GetWeatherInfo(hCode, hIsDay, NULL, 0));
+                pCode = strchr(pCode, ','); if (pCode) pCode++;
+                pIsDay = strchr(pIsDay, ','); if (pIsDay) pIsDay++;
+            }
+        }
+    }
+
+    SYSTEMTIME stSync;
+    GetLocalTime(&stSync);
+    int h12 = stSync.wHour % 12;
+    if (h12 == 0) h12 = 12;
+    StringCchPrintfW(g_weather.lastUpdated, ARRAYSIZE(g_weather.lastUpdated), L"Updated %d:%02d %s",
+        h12, stSync.wMinute, (stSync.wHour >= 12) ? L"PM" : L"AM");
+
+    g_weather.valid = TRUE;
+}
+
+BOOL ExecuteWeatherFetch() {
+    HINTERNET hInternet = InternetOpenW(L"Mozilla/5.0", INTERNET_OPEN_TYPE_PRECONFIG, NULL, NULL, 0);
+    if (!hInternet) return FALSE;
+
+    DWORD timeoutMs = 4000;
+    InternetSetOptionW(hInternet, INTERNET_OPTION_CONNECT_TIMEOUT, &timeoutMs, sizeof(timeoutMs));
+    InternetSetOptionW(hInternet, INTERNET_OPTION_RECEIVE_TIMEOUT, &timeoutMs, sizeof(timeoutMs));
+
+    WCHAR url[1024];
+    StringCchPrintfW(
+        url, ARRAYSIZE(url),
+        L"https://api.open-meteo.com/v1/forecast?latitude=%s&longitude=%s"
+        L"&current=temperature_2m,apparent_temperature,relative_humidity_2m,weather_code,wind_speed_10m,wind_direction_10m,uv_index,is_day"
+        L"&hourly=temperature_2m,weather_code,is_day"
+        L"&daily=weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max,sunrise,sunset"
+        L"&temperature_unit=fahrenheit&wind_speed_unit=mph&forecast_days=6&timezone=auto",
+        g_settings.latitude, g_settings.longitude
+    );
+
+    HINTERNET hUrl = InternetOpenUrlW(hInternet, url, NULL, 0, INTERNET_FLAG_RELOAD | INTERNET_FLAG_NO_CACHE_WRITE, 0);
+    BOOL success = FALSE;
+
+    if (hUrl) {
+        char* buffer = (char*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, 65536);
+        if (buffer) {
+            DWORD bytesRead = 0, totalBytes = 0;
+            while (InternetReadFile(hUrl, buffer + totalBytes, 65535 - totalBytes, &bytesRead) && bytesRead > 0) {
+                totalBytes += bytesRead;
+                if (totalBytes >= 65534) break;
+            }
+            buffer[totalBytes] = '\0';
+            ParseForecastJson(buffer);
+            HeapFree(GetProcessHeap(), 0, buffer);
+            success = TRUE;
+
+            if (g_hWndWeather && g_bRunning) InvalidateRect(g_hWndWeather, NULL, TRUE);
+            if (g_hWndFlyout && IsWindowVisible(g_hWndFlyout)) InvalidateRect(g_hWndFlyout, NULL, TRUE);
+        }
+        InternetCloseHandle(hUrl);
+    }
+    InternetCloseHandle(hInternet);
+    return success;
+}
+
+DWORD WINAPI FetchWeatherThread(LPVOID lpParam) {
+    BOOL isBoot = (BOOL)(INT_PTR)lpParam;
+    if (isBoot) {
+        for (int i = 0; i < 24 && g_bRunning; i++) {
+            if (ExecuteWeatherFetch()) break;
+            for (int s = 0; s < 50 && g_bRunning; s++) Sleep(100);
+        }
+    } else {
+        ExecuteWeatherFetch();
+    }
+    return 0;
+}
+
+void RepositionWeather(HWND hWnd) {
+    HMONITOR hMon = MonitorFromWindow(hWnd, MONITOR_DEFAULTTOPRIMARY);
+    MONITORINFO mi = { sizeof(mi) };
+    if (!GetMonitorInfoW(hMon, &mi)) return;
+
+    int winWidth = ScaleDpi(110);
+    int winHeight = ScaleDpi(24);
+    
+    // Unscaled raw pixel coordinates from monitor bounds for predictable flush alignment
+    int x = mi.rcMonitor.right - winWidth - g_settings.xOffset;
+    int y = mi.rcMonitor.top + g_settings.yOffset;
+
+    SetWindowRgn(hWnd, NULL, TRUE);
+    SetWindowPos(hWnd, HWND_TOPMOST, x, y, winWidth, winHeight, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+}
+
+void RepositionAndShowFlyout() {
+    if (!g_hWndWeather || !g_hWndFlyout) return;
+
+    RECT rcWeather;
+    GetWindowRect(g_hWndWeather, &rcWeather);
+
+    int width = ScaleDpi(590);
+    int height = ScaleDpi(295);
+    int x = (rcWeather.left + rcWeather.right) / 2 - (width / 2);
+    int y = rcWeather.bottom + ScaleDpi(8);
+
+    HRGN hRgn = CreateRoundRectRgn(0, 0, width + 1, height + 1, ScaleDpi(20), ScaleDpi(20));
+    SetWindowRgn(g_hWndFlyout, hRgn, TRUE);
+
+    SetWindowPos(g_hWndFlyout, HWND_TOPMOST, x, y, width, height, SWP_HIDEWINDOW);
+    AnimateWindow(g_hWndFlyout, 140, AW_BLEND | AW_SLIDE | AW_VER_POSITIVE | AW_ACTIVATE);
+    SetForegroundWindow(g_hWndFlyout);
+}
+
+void OpenWeatherWeb() {
+    WCHAR url[256];
+    StringCchPrintfW(url, ARRAYSIZE(url), L"https://open-meteo.com/en/docs?latitude=%s&longitude=%s",
+        g_settings.latitude, g_settings.longitude);
+    ShellExecuteW(NULL, L"open", url, NULL, NULL, SW_SHOWNORMAL);
+}
+
+LRESULT CALLBACK FlyoutWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
+    switch (uMsg) {
+    case WM_ACTIVATE:
+        if (LOWORD(wParam) == WA_INACTIVE) {
+            AnimateWindow(hWnd, 120, AW_BLEND | AW_HIDE);
+        }
+        return 0;
+
+    case WM_LBUTTONUP: {
+        int x = LOWORD(lParam);
+        int y = HIWORD(lParam);
+        RECT rcLoc = { ScaleDpi(20), ScaleDpi(16), ScaleDpi(240), ScaleDpi(44) };
+        if (PtInRect(&rcLoc, (POINT){ x, y })) {
+            OpenWeatherWeb();
+        }
+        return 0;
+    }
+
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        HDC hdc = BeginPaint(hWnd, &ps);
+
+        RECT rc;
+        GetClientRect(hWnd, &rc);
+
+        HDC memDC = CreateCompatibleDC(hdc);
+        HBITMAP memBmp = CreateCompatibleBitmap(hdc, rc.right, rc.bottom);
+        HGDIOBJ oldBmp = SelectObject(memDC, memBmp);
+
+        // Solid pure black canvas
+        HBRUSH bgBrush = CreateSolidBrush(RGB(15, 16, 19));
+        FillRect(memDC, &rc, bgBrush);
+        DeleteObject(bgBrush);
+
+        // Ambient radial glow background
+        if (g_weather.valid) {
+            int glowCX = ScaleDpi(50);
+            int glowCY = ScaleDpi(80);
+            int glowRadius = ScaleDpi(75);
+            
+            for (int r = glowRadius; r > 0; r -= ScaleDpi(8)) {
+                float f = (float)r / glowRadius;
+                COLORREF c = RGB(
+                    (BYTE)(15 + (1.0f - f) * 45),
+                    (BYTE)(16 + (1.0f - f) * 35),
+                    (BYTE)(19 + (1.0f - f) * 60)
+                );
+                HBRUSH b = CreateSolidBrush(c);
+                HGDIOBJ ob = SelectObject(memDC, b);
+                SelectObject(memDC, GetStockObject(NULL_PEN));
+                Ellipse(memDC, glowCX - r, glowCY - r, glowCX + r, glowCY + r);
+                SelectObject(memDC, ob);
+                DeleteObject(b);
+            }
+        }
+
+        // Slate border
+        HPEN rimPen = CreatePen(PS_SOLID, 1, RGB(42, 45, 52));
+        HGDIOBJ oldPen = SelectObject(memDC, rimPen);
+        SelectObject(memDC, GetStockObject(NULL_BRUSH));
+        RoundRect(memDC, 0, 0, rc.right, rc.bottom, ScaleDpi(20), ScaleDpi(20));
+        SelectObject(memDC, oldPen);
+        DeleteObject(rimPen);
+
+        SetBkMode(memDC, TRANSPARENT);
+
+        int padX = ScaleDpi(20);
+        int padY = ScaleDpi(16);
+
+        // Location Link
+        SelectObject(memDC, g_hFontTitle);
+        SetTextColor(memDC, RGB(255, 255, 255));
+        WCHAR locWithIco[72];
+        StringCchPrintfW(locWithIco, ARRAYSIZE(locWithIco), L"%s ↗", g_weather.location);
+        RECT rcLoc = { padX, padY, rc.right / 2, padY + ScaleDpi(26) };
+        DrawTextW(memDC, locWithIco, -1, &rcLoc, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+
+        // Date and Time on Right
+        SYSTEMTIME st;
+        GetLocalTime(&st);
+        const wchar_t* daysFull[] = { L"Sunday", L"Monday", L"Tuesday", L"Wednesday", L"Thursday", L"Friday", L"Saturday" };
+        const wchar_t* monthsShort[] = { L"Jan", L"Feb", L"Mar", L"Apr", L"May", L"Jun", L"Jul", L"Aug", L"Sept", L"Oct", L"Nov", L"Dec" };
+
+        WCHAR dateStr[64];
+        StringCchPrintfW(dateStr, ARRAYSIZE(dateStr), L"%s, %s %d", daysFull[st.wDayOfWeek % 7], monthsShort[(st.wMonth - 1) % 12], st.wDay);
+
+        int hour12 = st.wHour % 12;
+        if (hour12 == 0) hour12 = 12;
+        WCHAR timeStr[32];
+        StringCchPrintfW(timeStr, ARRAYSIZE(timeStr), L"%d:%02d %s", hour12, st.wMinute, (st.wHour >= 12) ? L"PM" : L"AM");
+
+        RECT rcTime = { rc.right - padX - ScaleDpi(85), padY, rc.right - padX, padY + ScaleDpi(26) };
+        DrawTextW(memDC, timeStr, -1, &rcTime, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+
+        SelectObject(memDC, g_hFontNormal);
+        SetTextColor(memDC, RGB(160, 165, 175));
+        RECT rcDate = { rcLoc.right, padY, rcTime.left - ScaleDpi(10), padY + ScaleDpi(26) };
+        DrawTextW(memDC, dateStr, -1, &rcDate, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+
+        if (g_weather.valid) {
+            // Weather Hero Icon
+            HFONT iconFont = CreateFontW(-ScaleDpi(40), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+                DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI Emoji");
+            SelectObject(memDC, iconFont);
+            RECT rcHeroIcon = { padX, ScaleDpi(48), padX + ScaleDpi(58), ScaleDpi(116) };
+            DrawTextW(memDC, g_weather.currentIcon, -1, &rcHeroIcon, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            DeleteObject(iconFont);
+
+            // Hero Temperature
+            SelectObject(memDC, g_hFontHeroTemp);
+            SetTextColor(memDC, RGB(255, 255, 255));
+            WCHAR curTempStr[16];
+            StringCchPrintfW(curTempStr, ARRAYSIZE(curTempStr), L"%d°", g_weather.currentTemp);
+            RECT rcHeroTemp = { padX + ScaleDpi(64), ScaleDpi(44), padX + ScaleDpi(145), ScaleDpi(98) };
+            DrawTextW(memDC, curTempStr, -1, &rcHeroTemp, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+
+            // Condition subtitle + H/L
+            SelectObject(memDC, g_hFontNormal);
+            SetTextColor(memDC, RGB(215, 220, 225));
+            RECT rcCondition = { padX + ScaleDpi(66), ScaleDpi(94), padX + ScaleDpi(195), ScaleDpi(110) };
+            DrawTextW(memDC, g_weather.conditionText, -1, &rcCondition, DT_LEFT | DT_SINGLELINE);
+
+            SetTextColor(memDC, RGB(140, 145, 155));
+            WCHAR hlStr[32];
+            StringCchPrintfW(hlStr, ARRAYSIZE(hlStr), L"H: %d°  L: %d°", g_weather.highTemp, g_weather.lowTemp);
+            RECT rcHL = { padX + ScaleDpi(66), ScaleDpi(110), padX + ScaleDpi(195), ScaleDpi(126) };
+            DrawTextW(memDC, hlStr, -1, &rcHL, DT_LEFT | DT_SINGLELINE);
+
+            // 3-Column Metrics Grid
+            int col1Left = rc.left + ScaleDpi(205);
+            int col2Left = col1Left + ScaleDpi(125);
+            int col3Left = col2Left + ScaleDpi(125);
+            int row1Y = ScaleDpi(58);
+            int row2Y = ScaleDpi(94);
+
+            // Col 1, Row 1: Precip
+            RECT rcPrecipIco = { col1Left, row1Y, col1Left + ScaleDpi(22), row1Y + ScaleDpi(26) };
+            DrawTextW(memDC, L"💧", -1, &rcPrecipIco, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+            SetTextColor(memDC, RGB(140, 145, 155));
+            RECT rcPrecipLbl = { col1Left + ScaleDpi(24), row1Y - ScaleDpi(2), col1Left + ScaleDpi(120), row1Y + ScaleDpi(14) };
+            DrawTextW(memDC, L"Precip:", -1, &rcPrecipLbl, DT_LEFT | DT_SINGLELINE);
+            SetTextColor(memDC, RGB(255, 255, 255));
+            SelectObject(memDC, g_hFontBold);
+            WCHAR precipVal[16];
+            StringCchPrintfW(precipVal, ARRAYSIZE(precipVal), L"%d%%", g_weather.precipProb);
+            RECT rcPrecipVal = { col1Left + ScaleDpi(24), row1Y + ScaleDpi(12), col1Left + ScaleDpi(120), row1Y + ScaleDpi(28) };
+            DrawTextW(memDC, precipVal, -1, &rcPrecipVal, DT_LEFT | DT_SINGLELINE);
+
+            // Col 1, Row 2: Humidity
+            SelectObject(memDC, g_hFontNormal);
+            RECT rcHumIco = { col1Left, row2Y, col1Left + ScaleDpi(22), row2Y + ScaleDpi(26) };
+            DrawTextW(memDC, L"🫧", -1, &rcHumIco, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+            SetTextColor(memDC, RGB(140, 145, 155));
+            RECT rcHumLbl = { col1Left + ScaleDpi(24), row2Y - ScaleDpi(2), col1Left + ScaleDpi(120), row2Y + ScaleDpi(14) };
+            DrawTextW(memDC, L"Humidity:", -1, &rcHumLbl, DT_LEFT | DT_SINGLELINE);
+            SetTextColor(memDC, RGB(255, 255, 255));
+            SelectObject(memDC, g_hFontBold);
+            WCHAR humVal[16];
+            StringCchPrintfW(humVal, ARRAYSIZE(humVal), L"%d%%", g_weather.humidity);
+            RECT rcHumVal = { col1Left + ScaleDpi(24), row2Y + ScaleDpi(12), col1Left + ScaleDpi(120), row2Y + ScaleDpi(28) };
+            DrawTextW(memDC, humVal, -1, &rcHumVal, DT_LEFT | DT_SINGLELINE);
+
+            // Col 2, Row 1: Wind
+            SelectObject(memDC, g_hFontNormal);
+            RECT rcWindIco = { col2Left, row1Y, col2Left + ScaleDpi(22), row1Y + ScaleDpi(26) };
+            DrawTextW(memDC, L"💨", -1, &rcWindIco, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+            SetTextColor(memDC, RGB(140, 145, 155));
+            RECT rcWindLbl = { col2Left + ScaleDpi(24), row1Y - ScaleDpi(2), col2Left + ScaleDpi(120), row1Y + ScaleDpi(14) };
+            DrawTextW(memDC, L"Wind:", -1, &rcWindLbl, DT_LEFT | DT_SINGLELINE);
+            SetTextColor(memDC, RGB(255, 255, 255));
+            SelectObject(memDC, g_hFontBold);
+            WCHAR windVal[32];
+            StringCchPrintfW(windVal, ARRAYSIZE(windVal), L"%.0f mph %s", g_weather.windSpeed, g_weather.windDir);
+            RECT rcWindVal = { col2Left + ScaleDpi(24), row1Y + ScaleDpi(12), col2Left + ScaleDpi(120), row1Y + ScaleDpi(28) };
+            DrawTextW(memDC, windVal, -1, &rcWindVal, DT_LEFT | DT_SINGLELINE);
+
+            // Col 2, Row 2: UV Index
+            SelectObject(memDC, g_hFontNormal);
+            RECT rcUvIco = { col2Left, row2Y, col2Left + ScaleDpi(22), row2Y + ScaleDpi(26) };
+            DrawTextW(memDC, L"☀️", -1, &rcUvIco, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+            SetTextColor(memDC, RGB(140, 145, 155));
+            RECT rcUvLbl = { col2Left + ScaleDpi(24), row2Y - ScaleDpi(2), col2Left + ScaleDpi(120), row2Y + ScaleDpi(14) };
+            DrawTextW(memDC, L"UV Index:", -1, &rcUvLbl, DT_LEFT | DT_SINGLELINE);
+            SetTextColor(memDC, RGB(255, 255, 255));
+            SelectObject(memDC, g_hFontBold);
+            const wchar_t* uvDesc = (g_weather.uvIndex < 3) ? L"Low" : ((g_weather.uvIndex < 6) ? L"Mod" : L"High");
+            WCHAR uvVal[32];
+            StringCchPrintfW(uvVal, ARRAYSIZE(uvVal), L"%.0f (%s)", g_weather.uvIndex, uvDesc);
+            RECT rcUvVal = { col2Left + ScaleDpi(24), row2Y + ScaleDpi(12), col2Left + ScaleDpi(120), row2Y + ScaleDpi(28) };
+            DrawTextW(memDC, uvVal, -1, &rcUvVal, DT_LEFT | DT_SINGLELINE);
+
+            // Col 3, Row 1: Sunrise
+            SelectObject(memDC, g_hFontNormal);
+            RECT rcRiseIco = { col3Left, row1Y, col3Left + ScaleDpi(22), row1Y + ScaleDpi(26) };
+            DrawTextW(memDC, L"🌅", -1, &rcRiseIco, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+            SetTextColor(memDC, RGB(140, 145, 155));
+            RECT rcRiseLbl = { col3Left + ScaleDpi(24), row1Y - ScaleDpi(2), rc.right - padX, row1Y + ScaleDpi(14) };
+            DrawTextW(memDC, L"Sunrise:", -1, &rcRiseLbl, DT_LEFT | DT_SINGLELINE);
+            SetTextColor(memDC, RGB(255, 255, 255));
+            SelectObject(memDC, g_hFontBold);
+            RECT rcRiseVal = { col3Left + ScaleDpi(24), row1Y + ScaleDpi(12), rc.right - padX, row1Y + ScaleDpi(28) };
+            DrawTextW(memDC, g_weather.sunriseTime[0] ? g_weather.sunriseTime : L"--", -1, &rcRiseVal, DT_LEFT | DT_SINGLELINE);
+
+            // Col 3, Row 2: Sunset
+            SelectObject(memDC, g_hFontNormal);
+            RECT rcSetIco = { col3Left, row2Y, col3Left + ScaleDpi(22), row2Y + ScaleDpi(26) };
+            DrawTextW(memDC, L"🌇", -1, &rcSetIco, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+            SetTextColor(memDC, RGB(140, 145, 155));
+            RECT rcSetLbl = { col3Left + ScaleDpi(24), row2Y - ScaleDpi(2), rc.right - padX, row2Y + ScaleDpi(14) };
+            DrawTextW(memDC, L"Sunset:", -1, &rcSetLbl, DT_LEFT | DT_SINGLELINE);
+            SetTextColor(memDC, RGB(255, 255, 255));
+            SelectObject(memDC, g_hFontBold);
+            RECT rcSetVal = { col3Left + ScaleDpi(24), row2Y + ScaleDpi(12), rc.right - padX, row2Y + ScaleDpi(28) };
+            DrawTextW(memDC, g_weather.sunsetTime[0] ? g_weather.sunsetTime : L"--", -1, &rcSetVal, DT_LEFT | DT_SINGLELINE);
+
+            // Lower Deck Left: Hourly Forecast (Static 5 Hours)
+            int bottomY = ScaleDpi(154);
+            SelectObject(memDC, g_hFontSmall);
+            SetTextColor(memDC, RGB(140, 145, 155));
+            RECT rcHourlyTitle = { padX, bottomY, padX + ScaleDpi(200), bottomY + ScaleDpi(16) };
+            DrawTextW(memDC, L"Hourly Forecast", -1, &rcHourlyTitle, DT_LEFT | DT_SINGLELINE);
+
+            RECT rcHourlyPill = { padX, bottomY + ScaleDpi(18), rc.left + ScaleDpi(350), bottomY + ScaleDpi(96) };
+            HBRUSH pillBrush = CreateSolidBrush(RGB(24, 25, 30));
+            HPEN pillPen = CreatePen(PS_SOLID, 1, RGB(42, 45, 52));
+            SelectObject(memDC, pillBrush);
+            SelectObject(memDC, pillPen);
+            RoundRect(memDC, rcHourlyPill.left, rcHourlyPill.top, rcHourlyPill.right, rcHourlyPill.bottom, ScaleDpi(14), ScaleDpi(14));
+            DeleteObject(pillBrush);
+            DeleteObject(pillPen);
+
+            int pillWidth = rcHourlyPill.right - rcHourlyPill.left;
+            int hColWidth = (pillWidth - ScaleDpi(16)) / 5;
+
+            for (int i = 0; i < 5; i++) {
+                int colLeft = rcHourlyPill.left + ScaleDpi(8) + (i * hColWidth);
+
+                RECT rcHTime = { colLeft, rcHourlyPill.top + ScaleDpi(8), colLeft + hColWidth, rcHourlyPill.top + ScaleDpi(24) };
+                RECT rcHIcon = { colLeft, rcHourlyPill.top + ScaleDpi(25), colLeft + hColWidth, rcHourlyPill.top + ScaleDpi(47) };
+                RECT rcHTemp = { colLeft, rcHourlyPill.top + ScaleDpi(49), colLeft + hColWidth, rcHourlyPill.top + ScaleDpi(67) };
+
+                SelectObject(memDC, g_hFontSmall);
+                SetTextColor(memDC, RGB(160, 165, 175));
+                DrawTextW(memDC, g_weather.hourly[i].time, -1, &rcHTime, DT_CENTER | DT_SINGLELINE);
+                DrawTextW(memDC, g_weather.hourly[i].icon, -1, &rcHIcon, DT_CENTER | DT_SINGLELINE);
+
+                SelectObject(memDC, g_hFontBold);
+                SetTextColor(memDC, RGB(255, 255, 255));
+                WCHAR ht[16];
+                StringCchPrintfW(ht, ARRAYSIZE(ht), L"%d°", g_weather.hourly[i].temp);
+                DrawTextW(memDC, ht, -1, &rcHTemp, DT_CENTER | DT_SINGLELINE);
+            }
+
+            // Lower Deck Right: 5-Day Outlook with Range Bars
+            int dailyLeft = rcHourlyPill.right + ScaleDpi(18);
+            RECT rcDailyTitle = { dailyLeft, bottomY, rc.right - padX, bottomY + ScaleDpi(16) };
+            SelectObject(memDC, g_hFontSmall);
+            SetTextColor(memDC, RGB(140, 145, 155));
+            DrawTextW(memDC, L"5-Day Outlook", -1, &rcDailyTitle, DT_LEFT | DT_SINGLELINE);
+
+            int dRowY = bottomY + ScaleDpi(20);
+            int dRowH = ScaleDpi(18);
+            int weekSpread = (g_weather.weekMaxTemp - g_weather.weekMinTemp);
+            if (weekSpread <= 0) weekSpread = 1;
+
+            for (int i = 0; i < 4; i++) {
+                RECT rcDDay   = { dailyLeft, dRowY, dailyLeft + ScaleDpi(28), dRowY + dRowH };
+                RECT rcDIcon  = { dailyLeft + ScaleDpi(30), dRowY, dailyLeft + ScaleDpi(50), dRowY + dRowH };
+                RECT rcMinLbl = { dailyLeft + ScaleDpi(52), dRowY, dailyLeft + ScaleDpi(74), dRowY + dRowH };
+
+                SelectObject(memDC, g_hFontSmall);
+                SetTextColor(memDC, RGB(215, 220, 225));
+                DrawTextW(memDC, g_weather.daily[i].day, -1, &rcDDay, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+                DrawTextW(memDC, g_weather.daily[i].icon, -1, &rcDIcon, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+
+                WCHAR minStr[8];
+                StringCchPrintfW(minStr, ARRAYSIZE(minStr), L"%d°", g_weather.daily[i].minTemp);
+                SetTextColor(memDC, RGB(130, 135, 145));
+                DrawTextW(memDC, minStr, -1, &rcMinLbl, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+
+                // Range Bar
+                int barTrackLeft = dailyLeft + ScaleDpi(78);
+                int barTrackRight = rc.right - padX - ScaleDpi(26);
+                int trackWidth = barTrackRight - barTrackLeft;
+
+                RECT rcTrack = { barTrackLeft, dRowY + ScaleDpi(6), barTrackRight, dRowY + ScaleDpi(10) };
+                HBRUSH trackBrush = CreateSolidBrush(RGB(32, 34, 40));
+                FillRect(memDC, &rcTrack, trackBrush);
+                DeleteObject(trackBrush);
+
+                int fillL = barTrackLeft + ((g_weather.daily[i].minTemp - g_weather.weekMinTemp) * trackWidth) / weekSpread;
+                int fillR = barTrackLeft + ((g_weather.daily[i].maxTemp - g_weather.weekMinTemp) * trackWidth) / weekSpread;
+                if (fillR - fillL < ScaleDpi(8)) fillR = fillL + ScaleDpi(8);
+
+                RECT rcFill = { fillL, dRowY + ScaleDpi(6), fillR, dRowY + ScaleDpi(10) };
+                HBRUSH fillBrush = CreateSolidBrush(RGB(245, 175, 65));
+                FillRect(memDC, &rcFill, fillBrush);
+                DeleteObject(fillBrush);
+
+                RECT rcMaxLbl = { barTrackRight + ScaleDpi(4), dRowY, rc.right - padX, dRowY + dRowH };
+                WCHAR maxStr[8];
+                StringCchPrintfW(maxStr, ARRAYSIZE(maxStr), L"%d°", g_weather.daily[i].maxTemp);
+                SelectObject(memDC, g_hFontBold);
+                SetTextColor(memDC, RGB(255, 255, 255));
+                DrawTextW(memDC, maxStr, -1, &rcMaxLbl, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+
+                dRowY += dRowH;
+            }
+
+            RECT rcFooter = { padX, rc.bottom - ScaleDpi(20), rc.right - padX, rc.bottom - ScaleDpi(6) };
+            SelectObject(memDC, g_hFontSmall);
+            SetTextColor(memDC, RGB(100, 105, 115));
+            DrawTextW(memDC, g_weather.lastUpdated, -1, &rcFooter, DT_LEFT | DT_SINGLELINE);
+        }
+
+        BitBlt(hdc, 0, 0, rc.right, rc.bottom, memDC, 0, 0, SRCCOPY);
+        SelectObject(memDC, oldBmp);
+        DeleteObject(memBmp);
+        DeleteDC(memDC);
+
+        EndPaint(hWnd, &ps);
+        return 0;
+    }
+    case WM_ERASEBKGND:
+        return 1;
+
+    case WM_DESTROY:
+        return 0;
+    }
+    return DefWindowProcW(hWnd, uMsg, wParam, lParam);
+}
+
+LRESULT CALLBACK WeatherWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
+    switch (uMsg) {
+    case WM_DISPLAYCHANGE:
+        LoadSettings();
+        RepositionWeather(hWnd);
+        return 0;
+
+    case WM_LBUTTONUP:
+        if (IsWindowVisible(g_hWndFlyout)) {
+            AnimateWindow(g_hWndFlyout, 120, AW_BLEND | AW_HIDE);
+        } else {
+            RepositionAndShowFlyout();
+        }
+        return 0;
+
+    case WM_RBUTTONUP: {
+        HANDLE hTh = CreateThread(NULL, 0, FetchWeatherThread, (LPVOID)FALSE, 0, NULL);
+        if (hTh) CloseHandle(hTh);
+        return 0;
+    }
+
+    case WM_SETCURSOR:
+        SetCursor(LoadCursor(NULL, IDC_HAND));
+        return TRUE;
+
+    case WM_TIMER:
+        if (wParam == 1001) {
+            BOOL isFullscreen = IsMonitorInFullscreen(hWnd);
+            BOOL isVisible = IsWindowVisible(hWnd);
+
+            if (isFullscreen && isVisible) {
+                ShowWindow(hWnd, SW_HIDE);
+                if (IsWindowVisible(g_hWndFlyout)) ShowWindow(g_hWndFlyout, SW_HIDE);
+            } else if (!isFullscreen) {
+                if (!isVisible) {
+                    ShowWindow(hWnd, SW_SHOWNOACTIVATE);
+                }
+                SetWindowPos(hWnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+            }
+        } else if (wParam == 1002) {
+            HANDLE hTh = CreateThread(NULL, 0, FetchWeatherThread, (LPVOID)FALSE, 0, NULL);
+            if (hTh) CloseHandle(hTh);
+        } else if (wParam == 1003) {
+            if (g_hWndFlyout && IsWindowVisible(g_hWndFlyout)) {
+                InvalidateRect(g_hWndFlyout, NULL, FALSE);
+            }
+        }
+        return 0;
+
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        HDC hdc = BeginPaint(hWnd, &ps);
+
+        RECT rc;
+        GetClientRect(hWnd, &rc);
+
+        HDC memDC = CreateCompatibleDC(hdc);
+        HBITMAP memBmp = CreateCompatibleBitmap(hdc, rc.right, rc.bottom);
+        HGDIOBJ oldBmp = SelectObject(memDC, memBmp);
+
+        // Fill with RGB(0,0,0) key color for 100% transparency
+        HBRUSH blackBrush = CreateSolidBrush(RGB(0, 0, 0));
+        FillRect(memDC, &rc, blackBrush);
+        DeleteObject(blackBrush);
+
+        SetBkMode(memDC, TRANSPARENT);
+        SetTextColor(memDC, g_settings.textColor);
+
+        HGDIOBJ oldFont = SelectObject(memDC, g_hFont);
+
+        if (g_weatherStr[0] != L'\0') {
+            DrawTextW(memDC, g_weatherStr, -1, &rc, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+        }
+
+        SelectObject(memDC, oldFont);
+        BitBlt(hdc, 0, 0, rc.right, rc.bottom, memDC, 0, 0, SRCCOPY);
+
+        SelectObject(memDC, oldBmp);
+        DeleteObject(memBmp);
+        DeleteDC(memDC);
+
+        EndPaint(hWnd, &ps);
+        return 0;
+    }
+
+    case WM_ERASEBKGND:
+        return 1;
+
+    case WM_DESTROY:
+        PostQuitMessage(0);
+        return 0;
+    }
+    return DefWindowProcW(hWnd, uMsg, wParam, lParam);
+}
+
+DWORD WINAPI WeatherWindowThread(LPVOID) {
+    WNDCLASSEXW wc = { sizeof(wc) };
+    wc.lpfnWndProc = WeatherWndProc;
+    wc.hInstance = GetModuleHandle(NULL);
+    wc.lpszClassName = L"WindhawkTopCenterWeatherBar";
+    RegisterClassExW(&wc);
+
+    WNDCLASSEXW wcf = { sizeof(wcf) };
+    wcf.lpfnWndProc = FlyoutWndProc;
+    wcf.hInstance = wc.hInstance;
+    wcf.lpszClassName = L"WindhawkWeatherFlyout";
+    RegisterClassExW(&wcf);
+
+    g_hWndWeather = CreateWindowExW(
+        WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_NOACTIVATE,
+        wc.lpszClassName, L"", 
+        WS_POPUP,
+        0, 0, ScaleDpi(110), ScaleDpi(24),
+        NULL, NULL, wc.hInstance, NULL
+    );
+
+    g_hWndFlyout = CreateWindowExW(
+        WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
+        wcf.lpszClassName, L"",
+        WS_POPUP,
+        0, 0, ScaleDpi(590), ScaleDpi(295),
+        NULL, NULL, wc.hInstance, NULL
+    );
+
+    if (g_hWndWeather) {
+        SetLayeredWindowAttributes(g_hWndWeather, RGB(0, 0, 0), 0, LWA_COLORKEY);
+        RepositionWeather(g_hWndWeather);
+
+        g_timerZOrder = SetTimer(g_hWndWeather, 1001, 200, NULL);
+        g_timerWeather = SetTimer(g_hWndWeather, 1002, 900000, NULL);
+        g_timerClock = SetTimer(g_hWndWeather, 1003, 1000, NULL);
+
+        HANDLE hTh = CreateThread(NULL, 0, FetchWeatherThread, (LPVOID)TRUE, 0, NULL);
+        if (hTh) CloseHandle(hTh);
+
+        MSG msg;
+        while (GetMessageW(&msg, NULL, 0, 0)) {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+    }
+    return 0;
+}
+
+BOOL Wh_ModInit() {
+    g_bRunning = TRUE;
+    LoadSettings();
+    g_hWeatherThread = CreateThread(NULL, 0, WeatherWindowThread, NULL, 0, &g_weatherThreadId);
+    return TRUE;
+}
+
+void Wh_ModUninit() {
+    g_bRunning = FALSE;
+    if (g_hWndFlyout) {
+        DestroyWindow(g_hWndFlyout);
+        g_hWndFlyout = NULL;
+    }
+    if (g_hWndWeather) {
+        KillTimer(g_hWndWeather, g_timerZOrder);
+        KillTimer(g_hWndWeather, g_timerWeather);
+        KillTimer(g_hWndWeather, g_timerClock);
+        DestroyWindow(g_hWndWeather);
+        g_hWndWeather = NULL;
+    }
+
+    if (g_weatherThreadId) {
+        PostThreadMessageW(g_weatherThreadId, WM_QUIT, 0, 0);
+    }
+
+    if (g_hWeatherThread) {
+        WaitForSingleObject(g_hWeatherThread, 1000);
+        CloseHandle(g_hWeatherThread);
+        g_hWeatherThread = NULL;
+    }
+
+    if (g_hFont) { DeleteObject(g_hFont); g_hFont = NULL; }
+    if (g_hFontHeroTemp) { DeleteObject(g_hFontHeroTemp); g_hFontHeroTemp = NULL; }
+    if (g_hFontTitle) { DeleteObject(g_hFontTitle); g_hFontTitle = NULL; }
+    if (g_hFontNormal) { DeleteObject(g_hFontNormal); g_hFontNormal = NULL; }
+    if (g_hFontBold) { DeleteObject(g_hFontBold); g_hFontBold = NULL; }
+    if (g_hFontSmall) { DeleteObject(g_hFontSmall); g_hFontSmall = NULL; }
+}
+
+void Wh_ModSettingsChanged() {
+    LoadSettings();
+    if (g_hWndWeather) {
+        RepositionWeather(g_hWndWeather);
+        HANDLE hTh = CreateThread(NULL, 0, FetchWeatherThread, (LPVOID)FALSE, 0, NULL);
+        if (hTh) CloseHandle(hTh);
+        InvalidateRect(g_hWndWeather, NULL, TRUE);
+    }
+}

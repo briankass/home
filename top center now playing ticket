@@ -1,8 +1,8 @@
 // ==WindhawkMod==
 // @id             top-center-now-playing
 // @name           Top Center Now Playing Ticker
-// @description    Minimalist live media ticker with smart fullscreen detection and inline playback controls.
-// @version        2.0.7
+// @description    Minimalist live media ticker with smooth scrolling and inline playback controls.
+// @version        2.4.1
 // @author         Custom
 // @include        explorer.exe
 // @compilerOptions -lgdi32 -luser32 -lole32 -loleaut32 -luuid -lwininet
@@ -11,7 +11,8 @@
 // ==WindhawkModReadme==
 /*
 Displays active media info and inline playback controls in the top bar.
-- Automatically hides only for true borderless fullscreen apps/games, ignoring maximized browsers.
+- Streamlined and stable single-row ticker layout.
+- Smoothly scrolls long track titles.
 - Integrated buttons for Previous, Play/Pause, Next, and Mute directly on the bar.
 */
 // ==/WindhawkModReadme==
@@ -55,6 +56,7 @@ HFONT g_hSymbolFont = NULL;
 
 UINT_PTR g_timerZOrder = 0;
 UINT_PTR g_timerMediaPoll = 0;
+UINT_PTR g_timerScroll = 0;
 
 volatile BOOL g_bRunning = TRUE;
 WCHAR g_trackText[256] = L"";
@@ -64,6 +66,10 @@ WCHAR g_trackArtist[128] = L"";
 BOOL g_isPlaying = FALSE;
 BOOL g_isMuted = FALSE;
 BOOL g_isFullscreen = FALSE;
+
+int g_scrollOffset = 0;
+int g_scrollDirection = 1;
+int g_scrollDelay = 0;
 
 int g_hoverBtn = 0;
 BOOL g_bMouseTracking = FALSE;
@@ -118,6 +124,8 @@ void LoadSettings() {
 BOOL CheckSystemMuteState() {
     BOOL bMuted = FALSE;
     HRESULT hr = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
+    if (FAILED(hr)) return FALSE;
+    
     IMMDeviceEnumerator* pEnumerator = NULL;
     hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), NULL, CLSCTX_INPROC_SERVER, __uuidof(IMMDeviceEnumerator), (void**)&pEnumerator);
     if (SUCCEEDED(hr) && pEnumerator) {
@@ -162,7 +170,6 @@ BOOL IsFullscreenAppRunning() {
             rcFg.right >= mi.rcMonitor.right &&
             rcFg.bottom >= mi.rcMonitor.bottom) {
             
-            // Ignore windows that have a standard title bar/caption (like maximized browsers)
             LONG style = GetWindowLongW(hFg, GWL_STYLE);
             if (style & WS_CAPTION) {
                 return FALSE;
@@ -379,6 +386,7 @@ void PollMediaSession() {
     if (wcslen(foundTrack) == 0) {
         if (g_isPlaying) {
             g_isPlaying = FALSE;
+            g_scrollOffset = 0;
             if (g_hWndMedia && g_bRunning) {
                 RepositionMedia(g_hWndMedia);
                 RedrawWindow(g_hWndMedia, NULL, NULL, RDW_ERASE | RDW_INVALIDATE | RDW_UPDATENOW);
@@ -396,13 +404,17 @@ void PollMediaSession() {
     WCHAR newArtist[128];
     ParseTitleAndArtist(foundTrack, newTitle, ARRAYSIZE(newTitle), newArtist, ARRAYSIZE(newArtist));
 
-    if (wcscmp(g_trackTitle, newTitle) != 0 || wcscmp(g_trackText, formatted) != 0 || !g_isPlaying || g_isMuted != currentMute) {
+    if (wcscmp(g_trackTitle, newTitle) != 0 || wcscmp(g_trackText, formatted) != 0) {
         StringCchCopyW(g_trackText, ARRAYSIZE(g_trackText), formatted);
         g_isPlaying = TRUE;
         g_isMuted = currentMute;
 
         StringCchCopyW(g_trackTitle, ARRAYSIZE(g_trackTitle), newTitle);
         StringCchCopyW(g_trackArtist, ARRAYSIZE(g_trackArtist), newArtist);
+
+        g_scrollOffset = 0;
+        g_scrollDirection = 1;
+        g_scrollDelay = 0;
 
         if (g_hWndMedia && g_bRunning && !g_isFullscreen) {
             RepositionMedia(g_hWndMedia);
@@ -509,6 +521,42 @@ LRESULT CALLBACK MediaWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam
             }
         } else if (wParam == 2002) {
             PollMediaSession();
+        } else if (wParam == 2003) {
+            if (g_isPlaying && g_trackText[0] != L'\0') {
+                HDC hdc = GetDC(hWnd);
+                if (hdc) {
+                    HGDIOBJ oldFont = SelectObject(hdc, g_hFont);
+                    SIZE size = {0};
+                    GetTextExtentPoint32W(hdc, g_trackText, (int)wcslen(g_trackText), &size);
+                    SelectObject(hdc, oldFont);
+                    ReleaseDC(hWnd, hdc);
+
+                    RECT rcClient;
+                    GetClientRect(hWnd, &rcClient);
+                    RECT rcFirstBtn = GetControlBtnRect(1, rcClient);
+                    int availableWidth = (rcFirstBtn.left - 6) - 10;
+
+                    if (size.cx > availableWidth) {
+                        int maxScroll = size.cx - availableWidth;
+                        
+                        if (g_scrollDelay > 0) {
+                            g_scrollDelay--;
+                        } else {
+                            g_scrollOffset += (g_scrollDirection * 2);
+                            if (g_scrollOffset >= maxScroll) {
+                                g_scrollOffset = maxScroll;
+                                g_scrollDirection = -1;
+                                g_scrollDelay = 30;
+                            } else if (g_scrollOffset <= 0) {
+                                g_scrollOffset = 0;
+                                g_scrollDirection = 1;
+                                g_scrollDelay = 30;
+                            }
+                            InvalidateRect(hWnd, NULL, FALSE);
+                        }
+                    }
+                }
+            }
         }
         return 0;
 
@@ -523,14 +571,24 @@ LRESULT CALLBACK MediaWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam
         DeleteObject(blackBrush);
 
         if (g_isPlaying && g_trackText[0] != L'\0') {
-            SetBkMode(hdc, TRANSPARENT);
             SetTextColor(hdc, g_settings.textColor);
+            SetBkColor(hdc, RGB(0, 0, 0));
             HGDIOBJ oldFont = SelectObject(hdc, g_hFont);
 
             RECT rcFirstBtn = GetControlBtnRect(1, rc);
             RECT rcText = { 10, 0, rcFirstBtn.left - 6, rc.bottom };
-            DrawTextW(hdc, g_trackText, -1, &rcText, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOCLIP);
 
+            int savedDC = SaveDC(hdc);
+            IntersectClipRect(hdc, rcText.left, rcText.top, rcText.right, rcText.bottom);
+            
+            SIZE textSize = {0};
+            GetTextExtentPoint32W(hdc, g_trackText, (int)wcslen(g_trackText), &textSize);
+            int textY = (rcText.bottom - rcText.top - textSize.cy) / 2;
+
+            ExtTextOutW(hdc, rcText.left - g_scrollOffset, textY, 
+                        ETO_OPAQUE | ETO_CLIPPED, &rcText, g_trackText, (UINT)wcslen(g_trackText), NULL);
+            
+            RestoreDC(hdc, savedDC);
             SelectObject(hdc, oldFont);
         }
 
@@ -574,6 +632,9 @@ DWORD WINAPI MediaWindowThread(LPVOID) {
     wc.lpfnWndProc = MediaWndProc;
     wc.hInstance = GetModuleHandle(NULL);
     wc.lpszClassName = L"WindhawkTopCenterMediaBar";
+    
+    // Unregister class first if it exists from a previous load to prevent race conditions
+    UnregisterClassW(wc.lpszClassName, wc.hInstance);
     RegisterClassExW(&wc);
 
     g_hWndMedia = CreateWindowExW(
@@ -586,10 +647,12 @@ DWORD WINAPI MediaWindowThread(LPVOID) {
 
     if (g_hWndMedia) {
         SetLayeredWindowAttributes(g_hWndMedia, RGB(0, 0, 0), 255, LWA_COLORKEY);
+
         RepositionMedia(g_hWndMedia);
 
-        g_timerZOrder = SetTimer(g_hWndMedia, 2001, 200, NULL);
-        g_timerMediaPoll = SetTimer(g_hWndMedia, 2002, 400, NULL);
+        g_timerZOrder = SetTimer(g_hWndMedia, 2001, 250, NULL);
+        g_timerMediaPoll = SetTimer(g_hWndMedia, 2002, 500, NULL);
+        g_timerScroll = SetTimer(g_hWndMedia, 2003, 80, NULL);
 
         PollMediaSession();
 
@@ -616,6 +679,7 @@ void Wh_ModUninit() {
     if (g_hWndMedia) {
         KillTimer(g_hWndMedia, g_timerZOrder);
         KillTimer(g_hWndMedia, g_timerMediaPoll);
+        KillTimer(g_hWndMedia, g_timerScroll);
         PostMessageW(g_hWndMedia, WM_MOD_CLOSE, 0, 0);
     }
 
